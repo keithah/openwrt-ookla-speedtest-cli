@@ -20,6 +20,9 @@ from scripts.update_ookla import (
 ARCHITECTURE = "aarch64_cortex-a53"
 PACKAGE = "ookla-speedtest-cli"
 SOURCE_URL = "https://install.speedtest.net/app/cli/"
+MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
+MAX_SOURCE_MEMBERS = 64
+MAX_EXECUTABLE_BYTES = 16 * 1024 * 1024
 
 
 def _assignment(recipe, name, value_pattern):
@@ -46,62 +49,81 @@ def _read_recipe(makefile):
     return version, release, checksum
 
 
-def _source_executable(archive):
-    validate_archive("aarch64", archive)
+def _check_archive_size(archive):
+    if len(archive) > MAX_ARCHIVE_BYTES:
+        raise UpdateError("compressed archive exceeds maximum size")
+
+
+def _preflight_source_archive(archive):
+    _check_archive_size(archive)
     try:
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as source:
-            members = source.getmembers()
-            if any(member.pax_headers for member in members):
-                raise UpdateError("source archive contains pax members")
-            matching = [member for member in members if member.name == "speedtest"]
-            if len(matching) != 1 or not matching[0].isfile():
+            member_count = 0
+            speedtest_count = 0
+            for member in source:
+                member_count += 1
+                if member_count > MAX_SOURCE_MEMBERS:
+                    raise UpdateError("source archive member count exceeds maximum")
+                if member.pax_headers:
+                    raise UpdateError("source archive contains pax members")
+                if member.size > MAX_EXECUTABLE_BYTES:
+                    if member.name == "speedtest":
+                        raise UpdateError("source executable exceeds maximum size")
+                    raise UpdateError("source archive member exceeds maximum size")
+                if member.name == "speedtest":
+                    speedtest_count += 1
+                    if not member.isfile():
+                        raise UpdateError(
+                            "source archive speedtest member is not a regular file"
+                        )
+            if speedtest_count != 1:
                 raise UpdateError(
                     "source archive must contain exactly one regular speedtest member"
                 )
-            extracted = source.extractfile(matching[0])
-            if extracted is None:
-                raise UpdateError("source archive speedtest member cannot be read")
-            return extracted.read()
     except UpdateError:
         raise
     except (tarfile.TarError, EOFError, OSError) as error:
         raise UpdateError(f"invalid archive: {error}") from error
 
 
-def _tar_gzip(name, contents, mode):
+def _source_executable(archive):
+    _preflight_source_archive(archive)
+    validate_archive("aarch64", archive)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as source:
+            member = next(
+                candidate for candidate in source if candidate.name == "speedtest"
+            )
+            extracted = source.extractfile(member)
+            if extracted is None:
+                raise UpdateError("source archive speedtest member cannot be read")
+            executable = extracted.read(MAX_EXECUTABLE_BYTES + 1)
+            if len(executable) > MAX_EXECUTABLE_BYTES:
+                raise UpdateError("source executable exceeds maximum size")
+            return executable
+    except UpdateError:
+        raise
+    except (StopIteration, tarfile.TarError, EOFError, OSError) as error:
+        raise UpdateError(f"invalid archive: {error}") from error
+
+
+def _gzip_ustar(members):
     compressed = io.BytesIO()
     with gzip.GzipFile(fileobj=compressed, mode="wb", filename="", mtime=0) as stream:
         with tarfile.open(
             fileobj=stream, mode="w", format=tarfile.USTAR_FORMAT
         ) as archive:
-            member = tarfile.TarInfo(name)
-            member.size = len(contents)
-            member.mode = mode
-            member.mtime = 0
-            member.uid = 0
-            member.gid = 0
-            member.uname = ""
-            member.gname = ""
-            archive.addfile(member, io.BytesIO(contents))
+            for name, contents, mode in members:
+                member = tarfile.TarInfo(name)
+                member.size = len(contents)
+                member.mode = mode
+                member.mtime = 0
+                member.uid = 0
+                member.gid = 0
+                member.uname = ""
+                member.gname = ""
+                archive.addfile(member, io.BytesIO(contents))
     return compressed.getvalue()
-
-
-def _ar_member(name, contents, mode=0o100644):
-    encoded_name = name.encode("ascii")
-    if len(encoded_name) > 16:
-        raise UpdateError(f"ar member name is too long: {name}")
-    header = b"".join(
-        (
-            encoded_name.ljust(16),
-            b"0".ljust(12),
-            b"0".ljust(6),
-            b"0".ljust(6),
-            format(mode, "o").encode("ascii").ljust(8),
-            str(len(contents)).encode("ascii").ljust(10),
-            b"`\n",
-        )
-    )
-    return header + contents + (b"\n" if len(contents) % 2 else b"")
 
 
 def _render_ipk(version, release, executable):
@@ -111,12 +133,19 @@ def _render_ipk(version, release, executable):
         f"Architecture: {ARCHITECTURE}\n"
         "License: Proprietary\n"
     ).encode("utf-8")
-    members = (
-        ("./debian-binary", b"2.0\n"),
-        ("./control.tar.gz", _tar_gzip("./control", control, 0o644)),
-        ("./data.tar.gz", _tar_gzip("./usr/bin/speedtest", executable, 0o755)),
+    control_archive = _gzip_ustar((("./control", control, 0o644),))
+    data_archive = _gzip_ustar((("./usr/bin/speedtest", executable, 0o755),))
+    return _gzip_ustar(
+        (
+            ("./debian-binary", b"2.0\n", 0o644),
+            ("./control.tar.gz", control_archive, 0o644),
+            ("./data.tar.gz", data_archive, 0o644),
+        )
     )
-    return b"!<arch>\n" + b"".join(_ar_member(name, data) for name, data in members)
+
+
+def _write_staged_ipk(path, contents):
+    path.write_bytes(contents)
 
 
 def build_ipk(makefile: Path, output_dir: Path, archive: bytes | None = None) -> Path:
@@ -128,6 +157,7 @@ def build_ipk(makefile: Path, output_dir: Path, archive: bytes | None = None) ->
         archive = _download(
             f"{SOURCE_URL}ookla-speedtest-{version}-linux-aarch64.tgz"
         )
+    _check_archive_size(archive)
     if archive_sha256(archive) != checksum:
         raise UpdateError("aarch64 source archive checksum mismatch")
     executable = _source_executable(archive)
@@ -140,7 +170,7 @@ def build_ipk(makefile: Path, output_dir: Path, archive: bytes | None = None) ->
         )
         with tempfile.TemporaryDirectory(dir=output_dir) as staging:
             temporary = Path(staging) / destination.name
-            temporary.write_bytes(package)
+            _write_staged_ipk(temporary, package)
             os.replace(temporary, destination)
         return destination
     except OSError as error:

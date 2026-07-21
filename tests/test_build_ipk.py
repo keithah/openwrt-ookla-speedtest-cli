@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import io
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -32,6 +33,7 @@ def source_archive(
     speedtest_name="speedtest",
     tar_format=tarfile.USTAR_FORMAT,
     extra_members=True,
+    filler_members=0,
 ):
     if payload is None:
         payload = aarch64_elf(program_types=(2,))
@@ -54,6 +56,9 @@ def source_archive(
                 extra = tarfile.TarInfo(name)
                 extra.size = len(contents)
                 archive.addfile(extra, io.BytesIO(contents))
+        for index in range(filler_members):
+            filler = tarfile.TarInfo(f"extra-{index}")
+            archive.addfile(filler, io.BytesIO())
     return raw.getvalue()
 
 
@@ -68,24 +73,11 @@ def makefile_for(archive):
     )
 
 
-def ar_members(data):
-    if data[:8] != b"!<arch>\n":
-        raise AssertionError("not an ar archive")
-    members = []
-    offset = 8
-    while offset < len(data):
-        header = data[offset : offset + 60]
-        if len(header) != 60 or header[58:60] != b"`\n":
-            raise AssertionError("invalid ar member header")
-        name = header[:16].decode("ascii").rstrip()
-        size = int(header[48:58].decode("ascii"))
-        start = offset + 60
-        members.append((name, header, data[start : start + size]))
-        offset = start + size + size % 2
-    return members
-
-
 def tar_members(gzip_data):
+    if gzip_data[:2] != b"\x1f\x8b":
+        raise AssertionError("not a gzip stream")
+    if gzip_data[4:8] != b"\0\0\0\0":
+        raise AssertionError("gzip mtime is not zero")
     raw = gzip.decompress(gzip_data)
     if raw[257:263] != b"ustar\0" or raw[263:265] != b"00":
         raise AssertionError("not a ustar archive")
@@ -119,16 +111,27 @@ class BuildIpkTest(unittest.TestCase):
             first.name,
         )
         self.assertEqual(first_bytes, second_bytes)
-        outer = ar_members(first_bytes)
+        outer_members, outer_files = tar_members(first_bytes)
         self.assertEqual(
             ["./debian-binary", "./control.tar.gz", "./data.tar.gz"],
-            [name for name, _, _ in outer],
+            [member.name for member in outer_members],
         )
-        self.assertEqual(b"2.0\n", outer[0][2])
-        for _, header, _ in outer:
-            self.assertEqual(b"0           ", header[16:28])
+        self.assertEqual(b"2.0\n", outer_files["./debian-binary"])
 
-        control_members, control_files = tar_members(outer[1][2])
+        listed = subprocess.run(
+            ("tar", "-tzf", first),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            "./debian-binary\n./control.tar.gz\n./data.tar.gz\n",
+            listed.stdout,
+        )
+
+        control_members, control_files = tar_members(
+            outer_files["./control.tar.gz"]
+        )
         self.assertEqual(["./control"], [member.name for member in control_members])
         self.assertEqual(
             "Package: ookla-speedtest-cli\n"
@@ -138,7 +141,7 @@ class BuildIpkTest(unittest.TestCase):
             control_files["./control"].decode("utf-8"),
         )
 
-        data_members, data_files = tar_members(outer[2][2])
+        data_members, data_files = tar_members(outer_files["./data.tar.gz"])
         self.assertEqual(
             ["./usr/bin/speedtest"], [member.name for member in data_members]
         )
@@ -170,6 +173,42 @@ class BuildIpkTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(UpdateError, "checksum"):
             builder.build_ipk(self.makefile, self.output, self.archive)
+
+    def test_declares_bounded_input_limits(self):
+        self.assertEqual(
+            16 * 1024 * 1024, getattr(builder, "MAX_ARCHIVE_BYTES", None)
+        )
+        self.assertEqual(64, getattr(builder, "MAX_SOURCE_MEMBERS", None))
+        self.assertEqual(
+            16 * 1024 * 1024, getattr(builder, "MAX_EXECUTABLE_BYTES", None)
+        )
+
+    def test_rejects_oversized_compressed_archive_before_validation(self):
+        archive = b"x" * (16 * 1024 * 1024 + 1)
+        self.makefile.write_text(makefile_for(archive), encoding="utf-8")
+        with mock.patch.object(builder, "archive_sha256") as digest, mock.patch.object(
+            builder, "validate_archive"
+        ) as validator:
+            with self.assertRaisesRegex(UpdateError, "compressed archive"):
+                builder.build_ipk(self.makefile, self.output, archive)
+        digest.assert_not_called()
+        validator.assert_not_called()
+
+    def test_rejects_too_many_source_members_before_validation(self):
+        archive = source_archive(filler_members=62)
+        self.makefile.write_text(makefile_for(archive), encoding="utf-8")
+        with mock.patch.object(builder, "validate_archive") as validator:
+            with self.assertRaisesRegex(UpdateError, "member count"):
+                builder.build_ipk(self.makefile, self.output, archive)
+        validator.assert_not_called()
+
+    def test_rejects_oversized_executable_before_validation(self):
+        archive = source_archive(payload=b"x" * (16 * 1024 * 1024 + 1))
+        self.makefile.write_text(makefile_for(archive), encoding="utf-8")
+        with mock.patch.object(builder, "validate_archive") as validator:
+            with self.assertRaisesRegex(UpdateError, "executable"):
+                builder.build_ipk(self.makefile, self.output, archive)
+        validator.assert_not_called()
 
     def test_rejects_non_aarch64_elf(self):
         archive = source_archive(aarch64_elf(machine=40))
@@ -216,6 +255,29 @@ class BuildIpkTest(unittest.TestCase):
                     self.makefile.write_text(malformed, encoding="utf-8")
                     with self.assertRaisesRegex(UpdateError, "exactly one"):
                         builder.build_ipk(self.makefile, self.output, self.archive)
+
+    def test_staged_write_failure_preserves_existing_package_and_cleans_up(self):
+        destination = self.output / (
+            "ookla-speedtest-cli_1.2.0-1_aarch64_cortex-a53.ipk"
+        )
+        self.output.mkdir()
+        destination.write_bytes(b"existing package")
+
+        def fail_after_partial_write(path, contents):
+            path.write_bytes(contents[:10])
+            raise OSError("controlled staged write failure")
+
+        with mock.patch.object(
+            builder,
+            "_write_staged_ipk",
+            create=True,
+            side_effect=fail_after_partial_write,
+        ):
+            with self.assertRaisesRegex(UpdateError, "controlled staged write failure"):
+                builder.build_ipk(self.makefile, self.output, self.archive)
+
+        self.assertEqual(b"existing package", destination.read_bytes())
+        self.assertEqual([destination], list(self.output.iterdir()))
 
 
 if __name__ == "__main__":
