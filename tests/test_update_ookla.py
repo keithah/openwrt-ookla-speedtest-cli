@@ -1,8 +1,14 @@
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
 import tarfile
+import tempfile
 import unittest
 from pathlib import Path
+import urllib.error
+from unittest import mock
+
+from scripts import update_ookla as updater
 
 from scripts.update_ookla import (
     UpdateError,
@@ -45,6 +51,14 @@ def archive_with_speedtest(payload, *, directory=False, member_name="speedtest")
             member.size = len(payload)
             archive.addfile(member, io.BytesIO(payload))
     return output.getvalue()
+
+
+def release_page(version):
+    return "\n".join(
+        "https://install.speedtest.net/app/cli/"
+        f"ookla-speedtest-{version}-linux-{arch}.tgz"
+        for arch in EXPECTED_ELF
+    ).encode("utf-8")
 
 
 class ReleaseDiscoveryTest(unittest.TestCase):
@@ -147,6 +161,18 @@ UNCHANGED:=yes
                         self.SOURCE + assignment + "\n", "1.10.0", self.HASHES
                     )
 
+    def test_assignment_whitespace_cannot_cross_a_line_boundary(self):
+        malformed = self.SOURCE.replace(
+            "PKG_VERSION:=1.2.0", "PKG_VERSION:=\n1.2.0"
+        )
+
+        rendered = render_makefile(malformed, "1.10.0", self.HASHES)
+
+        self.assertIn(
+            "PKG_VERSION:=1.10.0\n1.2.0\nPKG_RELEASE:=1",
+            rendered,
+        )
+
 
 class ArchiveValidationTest(unittest.TestCase):
     def test_accepts_expected_elf_for_each_architecture(self):
@@ -199,6 +225,144 @@ class ArchiveValidationTest(unittest.TestCase):
         data = archive_with_speedtest(elf_header(*EXPECTED_ELF["aarch64"]))
 
         self.assertEqual(hashlib.sha256(data).hexdigest(), archive_sha256(data))
+
+
+class UpdateTransactionTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.makefile = Path(self.temporary_directory.name) / "Makefile"
+        self.makefile.write_text(MakefileRenderingTest.SOURCE, encoding="utf-8")
+
+    def test_newer_check_reports_without_archive_downloads_or_writes(self):
+        original = self.makefile.read_bytes()
+        downloader = mock.Mock(return_value=release_page("1.10.0"))
+        output = io.StringIO()
+
+        with mock.patch.object(updater, "_download", downloader):
+            with redirect_stdout(output):
+                updater.update("https://page.test/cli", self.makefile, check=True)
+
+        self.assertEqual(
+            "new Ookla Speedtest CLI version available: 1.2.0 -> 1.10.0\n",
+            output.getvalue(),
+        )
+        downloader.assert_called_once_with("https://page.test/cli")
+        self.assertEqual(original, self.makefile.read_bytes())
+
+    def test_equal_or_older_release_is_a_successful_no_op(self):
+        original = self.makefile.read_bytes()
+        for latest in ("1.2.0", "1.1.9"):
+            with self.subTest(latest=latest):
+                downloader = mock.Mock(return_value=release_page(latest))
+                output = io.StringIO()
+                with mock.patch.object(updater, "_download", downloader):
+                    with redirect_stdout(output):
+                        updater.update("https://page.test/cli", self.makefile)
+
+                self.assertEqual(
+                    "ookla-speedtest-cli is already at 1.2.0\n",
+                    output.getvalue(),
+                )
+                downloader.assert_called_once_with("https://page.test/cli")
+                self.assertEqual(original, self.makefile.read_bytes())
+
+    def test_download_failure_propagates_without_writing(self):
+        original = self.makefile.read_bytes()
+        failure = UpdateError("upstream unavailable")
+
+        with mock.patch.object(updater, "_download", side_effect=failure):
+            with self.assertRaisesRegex(UpdateError, "upstream unavailable"):
+                updater.update("https://page.test/cli", self.makefile)
+
+        self.assertEqual(original, self.makefile.read_bytes())
+
+    def test_invalid_third_archive_leaves_recipe_unchanged(self):
+        original = self.makefile.read_bytes()
+        archives = {
+            arch: archive_with_speedtest(elf_header(*expected))
+            for arch, expected in EXPECTED_ELF.items()
+        }
+        archives["armel"] = b"not a tarball"
+        requested = []
+
+        def download(url):
+            requested.append(url)
+            if url == "https://page.test/cli":
+                return release_page("1.10.0")
+            return next(
+                data
+                for arch, data in archives.items()
+                if f"-{arch}.tgz" in url
+            )
+
+        with mock.patch.object(updater, "_download", side_effect=download):
+            with self.assertRaises(UpdateError):
+                updater.update("https://page.test/cli", self.makefile)
+
+        self.assertEqual(4, len(requested))
+        self.assertTrue(requested[-1].endswith("-armel.tgz"))
+        self.assertEqual(original, self.makefile.read_bytes())
+
+    def test_update_validates_archives_and_atomically_replaces_recipe(self):
+        archives = {
+            arch: archive_with_speedtest(elf_header(*expected))
+            for arch, expected in EXPECTED_ELF.items()
+        }
+
+        def download(url):
+            if url == "https://page.test/cli":
+                return release_page("1.10.0")
+            return next(
+                data
+                for arch, data in archives.items()
+                if f"-{arch}.tgz" in url
+            )
+
+        output = io.StringIO()
+        with mock.patch.object(updater, "_download", side_effect=download):
+            with mock.patch.object(
+                updater.os, "replace", wraps=updater.os.replace
+            ) as replace:
+                with redirect_stdout(output):
+                    updater.update("https://page.test/cli", self.makefile)
+
+        self.assertEqual(
+            "updated ookla-speedtest-cli: 1.2.0 -> 1.10.0\n", output.getvalue()
+        )
+        rendered = self.makefile.read_text(encoding="utf-8")
+        self.assertIn("PKG_VERSION:=1.10.0", rendered)
+        self.assertIn("PKG_RELEASE:=1", rendered)
+        for arch, data in archives.items():
+            self.assertIn(f"OOKLA_HASH_{arch}:={archive_sha256(data)}", rendered)
+        replace.assert_called_once()
+        source, destination = map(Path, replace.call_args.args)
+        self.assertEqual(self.makefile.parent, source.parent)
+        self.assertEqual(self.makefile, destination)
+
+
+class CliContractTest(unittest.TestCase):
+    def test_http_failure_becomes_update_error_and_uses_timeout(self):
+        with mock.patch.object(
+            updater.urllib.request,
+            "urlopen",
+            side_effect=urllib.error.URLError("offline"),
+        ) as urlopen:
+            with self.assertRaisesRegex(UpdateError, "failed to fetch"):
+                updater._download("https://page.test/cli")
+
+        urlopen.assert_called_once_with("https://page.test/cli", timeout=30)
+
+    def test_main_returns_nonzero_and_reports_update_error(self):
+        error = io.StringIO()
+        with mock.patch.object(
+            updater, "update", side_effect=UpdateError("invalid upstream state")
+        ):
+            with redirect_stderr(error):
+                result = updater.main(["--check"])
+
+        self.assertEqual(1, result)
+        self.assertEqual("error: invalid upstream state\n", error.getvalue())
 
 
 if __name__ == "__main__":

@@ -53,8 +53,12 @@ def latest_complete_release(html):
         raise UpdateError("upstream page contains no complete semantic release")
     return max(
         complete,
-        key=lambda value: tuple(int(part) for part in value.split(".")),
+        key=_version_key,
     )
+
+
+def _version_key(version):
+    return tuple(int(part) for part in version.split("."))
 
 
 def archive_sha256(data):
@@ -100,7 +104,9 @@ def validate_archive(arch, data):
 
 
 def _replace_assignment(text, name, value):
-    pattern = re.compile(rf"(?m)^({re.escape(name)}\s*:=\s*)[^\r\n]*$")
+    pattern = re.compile(
+        rf"(?m)^({re.escape(name)}[ \t]*:=[ \t]*)[^\r\n]*$"
+    )
     if len(pattern.findall(text)) != 1:
         raise UpdateError(f"expected exactly one {name} assignment")
     return pattern.sub(lambda match: match.group(1) + value, text)
@@ -134,7 +140,10 @@ def _download(url):
 
 
 def _read_current_version(makefile_text):
-    match = re.findall(r"(?m)^PKG_VERSION\s*:=\s*(\d+\.\d+\.\d+)\s*$", makefile_text)
+    match = re.findall(
+        r"(?m)^PKG_VERSION[ \t]*:=[ \t]*(\d+\.\d+\.\d+)[ \t]*$",
+        makefile_text,
+    )
     if len(match) != 1:
         raise UpdateError("expected exactly one semantic PKG_VERSION assignment")
     return match[0]
@@ -175,7 +184,7 @@ def update(page_url=PAGE_URL, makefile=REPOSITORY_MAKEFILE, check=False):
         raise UpdateError("upstream page is not valid UTF-8") from error
     latest = latest_complete_release(page)
 
-    if latest == current:
+    if _version_key(latest) <= _version_key(current):
         print(f"ookla-speedtest-cli is already at {current}")
         return
     if check:
