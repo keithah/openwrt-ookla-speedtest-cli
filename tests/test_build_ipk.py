@@ -157,7 +157,8 @@ class BuildIpkTest(unittest.TestCase):
             builder.build_ipk(self.makefile, self.output)
         download.assert_called_once_with(
             "https://install.speedtest.net/app/cli/"
-            "ookla-speedtest-1.2.0-linux-aarch64.tgz"
+            "ookla-speedtest-1.2.0-linux-aarch64.tgz",
+            max_bytes=builder.MAX_ARCHIVE_BYTES,
         )
 
         with mock.patch.object(builder, "_download") as download:

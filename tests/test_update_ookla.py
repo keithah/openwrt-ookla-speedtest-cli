@@ -1,5 +1,6 @@
 from contextlib import redirect_stderr, redirect_stdout
 import hashlib
+import inspect
 import io
 import tarfile
 import tempfile
@@ -430,6 +431,88 @@ class UpdateTransactionTest(unittest.TestCase):
 
 
 class CliContractTest(unittest.TestCase):
+    class FakeResponse:
+        def __init__(self, body, content_length=None):
+            self.body = body
+            self.status = 200
+            self.headers = {}
+            if content_length is not None:
+                self.headers["Content-Length"] = str(content_length)
+            self.read_calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size=-1):
+            self.read_calls.append(size)
+            return self.body if size == -1 else self.body[:size]
+
+    def assert_bounded_download_supported(self):
+        parameters = inspect.signature(updater._download).parameters
+        self.assertIn("max_bytes", parameters)
+        self.assertEqual(inspect.Parameter.KEYWORD_ONLY, parameters["max_bytes"].kind)
+        self.assertEqual(int | None, parameters["max_bytes"].annotation)
+
+    def test_bounded_download_rejects_oversized_content_length_before_read(self):
+        self.assert_bounded_download_supported()
+        response = self.FakeResponse(b"unused", content_length=6)
+        with mock.patch.object(
+            updater.urllib.request, "urlopen", return_value=response
+        ):
+            with self.assertRaisesRegex(UpdateError, "download exceeds"):
+                updater._download("https://archive.test/file", max_bytes=5)
+
+        self.assertEqual([], response.read_calls)
+
+    def test_bounded_download_rejects_oversized_body_without_content_length(self):
+        self.assert_bounded_download_supported()
+        response = self.FakeResponse(b"123456")
+        with mock.patch.object(
+            updater.urllib.request, "urlopen", return_value=response
+        ):
+            with self.assertRaisesRegex(UpdateError, "download exceeds"):
+                updater._download("https://archive.test/file", max_bytes=5)
+
+        self.assertEqual([6], response.read_calls)
+
+    def test_bounded_download_accepts_body_at_exact_limit(self):
+        self.assert_bounded_download_supported()
+        response = self.FakeResponse(b"12345", content_length=5)
+        with mock.patch.object(
+            updater.urllib.request, "urlopen", return_value=response
+        ):
+            result = updater._download("https://archive.test/file", max_bytes=5)
+
+        self.assertEqual(b"12345", result)
+        self.assertEqual([6], response.read_calls)
+
+    def test_bounded_download_preserves_request_identity_and_timeout(self):
+        self.assert_bounded_download_supported()
+        response = self.FakeResponse(b"body")
+        with mock.patch.object(
+            updater.urllib.request, "urlopen", return_value=response
+        ) as urlopen:
+            updater._download("https://archive.test/file", max_bytes=10)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            "openwrt-ookla-speedtest-cli-updater/1.0",
+            request.get_header("User-agent"),
+        )
+        self.assertEqual(30, urlopen.call_args.kwargs["timeout"])
+
+    def test_download_without_limit_preserves_unbounded_read(self):
+        response = self.FakeResponse(b"body")
+        with mock.patch.object(
+            updater.urllib.request, "urlopen", return_value=response
+        ):
+            self.assertEqual(b"body", updater._download("https://page.test/cli"))
+
+        self.assertEqual([-1], response.read_calls)
+
     def test_http_failure_becomes_update_error_and_identifies_updater(self):
         with mock.patch.object(
             updater.urllib.request,

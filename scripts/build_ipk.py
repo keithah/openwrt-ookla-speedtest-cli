@@ -155,7 +155,8 @@ def build_ipk(makefile: Path, output_dir: Path, archive: bytes | None = None) ->
     version, release, checksum = _read_recipe(makefile)
     if archive is None:
         archive = _download(
-            f"{SOURCE_URL}ookla-speedtest-{version}-linux-aarch64.tgz"
+            f"{SOURCE_URL}ookla-speedtest-{version}-linux-aarch64.tgz",
+            max_bytes=MAX_ARCHIVE_BYTES,
         )
     _check_archive_size(archive)
     if archive_sha256(archive) != checksum:

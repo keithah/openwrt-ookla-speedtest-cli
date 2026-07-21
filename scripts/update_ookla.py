@@ -157,7 +157,7 @@ def render_makefile(text, version, hashes):
     return rendered
 
 
-def _download(url):
+def _download(url, *, max_bytes: int | None = None):
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "openwrt-ookla-speedtest-cli-updater/1.0"},
@@ -169,7 +169,21 @@ def _download(url):
                 status = 200
             if not 200 <= status < 300:
                 raise UpdateError(f"HTTP {status} fetching {url}")
-            return response.read()
+            if max_bytes is None:
+                return response.read()
+
+            content_length = response.headers.get("Content-Length")
+            try:
+                reported_size = int(content_length)
+            except (TypeError, ValueError):
+                reported_size = None
+            if reported_size is not None and reported_size > max_bytes:
+                raise UpdateError(f"download exceeds maximum size fetching {url}")
+
+            data = response.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise UpdateError(f"download exceeds maximum size fetching {url}")
+            return data
     except UpdateError:
         raise
     except (urllib.error.URLError, OSError) as error:
