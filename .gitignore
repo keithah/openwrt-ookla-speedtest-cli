@@ -4,5 +4,6 @@
 dl/
 bin/
 build_dir/
+dist/
 __pycache__/
 *.pyc
