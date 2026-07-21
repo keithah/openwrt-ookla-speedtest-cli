@@ -15,6 +15,26 @@ The recipe supports Ookla's Linux ARM releases for:
 
 Other architectures are not selectable for this package.
 
+## Install from the signed feed
+
+On an OpenWrt router whose `opkg print-architecture` output includes
+`aarch64_cortex-a53`, install the prebuilt IPK from the project-maintained
+signed feed:
+
+```sh
+wget -qO- https://keithah.github.io/openwrt-packages/install-ookla-speedtest-cli.sh | sh
+```
+
+The installer adds the feed's public key without disabling opkg signature
+verification, configures the `keithah` feed, updates its package lists, and
+installs only `ookla-speedtest-cli`. The published feed currently supports
+only `aarch64_cortex-a53`; use the source-build instructions below for the
+other supported ARM targets and for OpenWrt releases that use APK packages.
+
+The installer does not accept Ookla's license agreement. The first
+`speedtest` run asks you to review and accept the Ookla EULA and privacy
+policy.
+
 ## Build and install
 
 From the root of an OpenWrt source tree on the build host, clone the package,
