@@ -1,5 +1,6 @@
 *.tgz
 *.ipk
+*.apk
 dl/
 bin/
 build_dir/

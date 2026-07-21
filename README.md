@@ -3,7 +3,7 @@
 This repository provides an unofficial, source-only OpenWrt package recipe for
 the [Ookla Speedtest CLI](https://www.speedtest.net/apps/cli). It does not
 contain or distribute Ookla binaries, release archives, or prebuilt OpenWrt
-packages.
+`.ipk` or `.apk` packages.
 
 ## Supported targets
 
@@ -31,12 +31,35 @@ make package/ookla-speedtest-cli/compile V=s
 The OpenWrt build downloads the matching vendor archive and verifies it
 against the architecture-specific SHA-256 checksum pinned in the recipe.
 
-Copy the generated `.ipk` from the build host's `bin/packages/` tree to
-`/tmp` on the OpenWrt router. Then run these commands on the router (the
-`/tmp` path below is the router's filesystem, not the build host's):
+The output package format and package manager depend on the OpenWrt version:
+
+- OpenWrt 24.10 and older produce an `.ipk`, installed with `opkg`.
+- OpenWrt 25.12 and newer produce an `.apk`, installed with `apk`.
+
+See OpenWrt's [package-management overview](https://openwrt.org/docs/guide-user/additional-software/managing_packages)
+and [APK documentation](https://openwrt.org/docs/guide-user/additional-software/apk)
+for the official version-specific guidance.
+
+Copy the generated `.ipk` or `.apk` from the build host's `bin/packages/`
+tree to `/tmp` on the OpenWrt router. The `/tmp` paths in the commands below
+refer to the router's filesystem, not the build host's.
+
+On an OpenWrt 24.10 or older router, install the `.ipk`:
 
 ```bash
 opkg install /tmp/ookla-speedtest-cli_*.ipk
+```
+
+On an OpenWrt 25.12 or newer router, install the locally built, unsigned
+`.apk` with the required `--allow-untrusted` option:
+
+```bash
+apk add --allow-untrusted /tmp/ookla-speedtest-cli-*.apk
+```
+
+Then run `speedtest` on the router:
+
+```bash
 speedtest
 ```
 
@@ -49,10 +72,11 @@ before accepting it.
 A scheduled GitHub Actions workflow checks Ookla's official CLI page daily for
 a complete newer ARM release. It downloads the three supported archives in
 temporary runner storage, validates their archive and ELF architecture, and
-updates only the version and pinned checksums in the recipe. After the test
-suite passes, the workflow commits that text-only recipe update directly to
-`main`. It never commits or publishes the vendor archives, executables, or
-generated `.ipk` files.
+changes `PKG_VERSION`, resets `PKG_RELEASE` to `1`, and replaces all three
+architecture-specific checksums in the recipe.
+After the test suite passes, the workflow commits that text-only recipe update
+directly to `main`. It never commits or publishes the vendor archives,
+executables, or generated `.ipk` or `.apk` files.
 
 ## Licensing and trademarks
 

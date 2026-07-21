@@ -1,3 +1,4 @@
+import os
 import re
 import subprocess
 import tempfile
@@ -10,10 +11,12 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 RECIPE = REPOSITORY_ROOT / "Makefile"
 UPDATE_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "update-ookla.yml"
 GITIGNORE = REPOSITORY_ROOT / ".gitignore"
+README = REPOSITORY_ROOT / "README.md"
 
 IGNORED_BUILD_ARTIFACTS = {
     "*.tgz",
     "*.ipk",
+    "*.apk",
     "dl/",
     "bin/",
     "build_dir/",
@@ -21,6 +24,7 @@ IGNORED_BUILD_ARTIFACTS = {
     "*.pyc",
 }
 BINARY_SUFFIXES = {".tgz", ".ipk", ".apk", ".bin", ".elf"}
+EXCLUDED_SCAN_DIRECTORIES = {".git", ".superpowers"}
 
 CASES = {
     ("aarch64", False): "aarch64",
@@ -33,6 +37,22 @@ SIMULATED_UPDATE_HASHES = {
     "armhf": "b" * 64,
     "armel": "c" * 64,
 }
+
+
+def find_binary_artifacts(root):
+    root = Path(root)
+    artifacts = []
+    for directory, subdirectories, filenames in os.walk(root):
+        subdirectories[:] = [
+            name for name in subdirectories if name not in EXCLUDED_SCAN_DIRECTORIES
+        ]
+        directory = Path(directory)
+        artifacts.extend(
+            path.relative_to(root)
+            for path in (directory / filename for filename in filenames)
+            if path.suffix.lower() in BINARY_SUFFIXES
+        )
+    return sorted(artifacts)
 
 
 class RecipeTest(unittest.TestCase):
@@ -176,20 +196,58 @@ class RecipeTest(unittest.TestCase):
             f"missing ignore patterns: {sorted(IGNORED_BUILD_ARTIFACTS - ignored_patterns)}",
         )
 
-    def test_tracked_files_contain_no_binary_artifacts(self):
-        result = subprocess.run(
-            ["git", "ls-files"],
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
+    def test_repository_workspace_contains_no_binary_artifacts(self):
+        self.assertEqual([], find_binary_artifacts(REPOSITORY_ROOT))
+
+    def test_binary_scan_finds_workspace_artifacts_and_skips_internal_directories(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "nested").mkdir()
+            (root / ".git").mkdir()
+            (root / ".superpowers").mkdir()
+            for relative_path in (
+                "ignored-like.apk",
+                "nested/archive.TGZ",
+                "nested/package.IPK",
+                "nested/program.BIN",
+                "nested/program.ELF",
+                ".git/internal.apk",
+                ".superpowers/review.bin",
+            ):
+                (root / relative_path).write_bytes(b"test fixture")
+
+            self.assertEqual(
+                [
+                    Path("ignored-like.apk"),
+                    Path("nested/archive.TGZ"),
+                    Path("nested/package.IPK"),
+                    Path("nested/program.BIN"),
+                    Path("nested/program.ELF"),
+                ],
+                find_binary_artifacts(root),
+            )
+
+    def test_readme_documents_openwrt_package_formats_and_updates(self):
+        readme = README.read_text(encoding="utf-8")
+        for required in (
+            "OpenWrt 24.10 and older",
+            "OpenWrt 25.12 and newer",
+            "opkg install /tmp/ookla-speedtest-cli_*.ipk",
+            "apk add --allow-untrusted /tmp/ookla-speedtest-cli-*.apk",
+            "https://openwrt.org/docs/guide-user/additional-software/managing_packages",
+            "https://openwrt.org/docs/guide-user/additional-software/apk",
+            "`PKG_VERSION`",
+            "`PKG_RELEASE` to `1`",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, readme)
+
+        self.assertRegex(
+            readme,
+            r"(?s)(?:(?:source-only|never commits).*?\.ipk.*?\.apk|"
+            r"(?:source-only|never commits).*?\.apk.*?\.ipk)",
         )
-        binary_artifacts = sorted(
-            path
-            for path in result.stdout.splitlines()
-            if Path(path).suffix.lower() in BINARY_SUFFIXES
-        )
-        self.assertEqual([], binary_artifacts)
+        self.assertRegex(readme, r"all\s+three\s+architecture-specific checksums")
 
 
 if __name__ == "__main__":
