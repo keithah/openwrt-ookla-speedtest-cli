@@ -60,6 +60,37 @@ run_case() {
 		"$@" /bin/sh "$installer"
 }
 
+add_partial_mktemp_failure() {
+	case_root="$tmp/$1"
+	cat >"$case_root/bin/mktemp" <<'EOF'
+#!/bin/sh
+count=0
+[ ! -f "$FAKE_MKTEMP_STATE" ] || count=$(cat "$FAKE_MKTEMP_STATE")
+count=$((count + 1))
+printf '%s\n' "$count" >"$FAKE_MKTEMP_STATE"
+[ "$count" -ne 2 ] || exit 70
+path=$(/usr/bin/mktemp "$@") || exit
+printf '%s\n' "$path" >>"$FAKE_MKTEMP_PATHS"
+printf '%s\n' "$path"
+EOF
+	chmod +x "$case_root/bin/mktemp"
+}
+
+add_interrupting_chmod() {
+	case_root="$tmp/$1"
+	cat >"$case_root/bin/chmod" <<'EOF'
+#!/bin/sh
+case "$2" in
+	*/.keithah-key.*)
+		kill -TERM "$PPID"
+		exit 0
+		;;
+esac
+exec /bin/chmod "$@"
+EOF
+	chmod +x "$case_root/bin/chmod"
+}
+
 expect_failure() {
 	if "$@" >"$tmp/failure.out" 2>"$tmp/failure.err"; then
 		fail "command unexpectedly succeeded: $*"
@@ -153,5 +184,44 @@ printf 'src/gz keithah https://feed.example/packages\nsrc/gz core https://downlo
 cmp -s "$unterminated_managed_expected" \
 	"$tmp/unterminated_managed/root/etc/opkg/customfeeds.conf" ||
 	fail 'unterminated managed final record was not removed cleanly'
+
+# Cleanup must already be active if a later mktemp fails.
+lifecycle_failures=''
+make_case partial_mktemp "$base_feeds"
+add_partial_mktemp_failure partial_mktemp
+printf '%s\n' 0 >"$tmp/partial_mktemp/mktemp-state"
+: >"$tmp/partial_mktemp/mktemp-paths"
+partial_status=0
+run_case partial_mktemp \
+	FAKE_MKTEMP_STATE="$tmp/partial_mktemp/mktemp-state" \
+	FAKE_MKTEMP_PATHS="$tmp/partial_mktemp/mktemp-paths" \
+	>"$tmp/partial-mktemp.out" 2>"$tmp/partial-mktemp.err" || partial_status=$?
+[ "$partial_status" -ne 0 ] || lifecycle_failures="$lifecycle_failures partial mktemp unexpectedly succeeded;"
+while IFS= read -r created_path; do
+	[ ! -e "$created_path" ] || lifecycle_failures="$lifecycle_failures leaked $created_path;"
+done <"$tmp/partial_mktemp/mktemp-paths"
+assert_count "$tmp/partial_mktemp/commands" '^opkg update$' 0
+assert_count "$tmp/partial_mktemp/commands" '^opkg install ' 0
+
+# A caught signal must clean up and terminate before later mutation or opkg use.
+make_case interrupted "$base_feeds"
+add_interrupting_chmod interrupted
+cp "$tmp/interrupted/root/etc/opkg/customfeeds.conf" "$tmp/interrupted/original-feeds"
+interrupt_status=0
+run_case interrupted >"$tmp/interrupted.out" 2>"$tmp/interrupted.err" || interrupt_status=$?
+[ "$interrupt_status" -eq 143 ] ||
+	lifecycle_failures="$lifecycle_failures TERM exited $interrupt_status instead of 143;"
+cmp -s "$tmp/interrupted/original-feeds" "$tmp/interrupted/root/etc/opkg/customfeeds.conf" ||
+	lifecycle_failures="$lifecycle_failures TERM changed customfeeds.conf;"
+[ ! -e "$tmp/interrupted/root/etc/opkg/keys/f6c72c675c844b91" ] ||
+	lifecycle_failures="$lifecycle_failures TERM installed the feed key;"
+assert_count "$tmp/interrupted/commands" '^opkg update$' 0
+assert_count "$tmp/interrupted/commands" '^opkg install ' 0
+if find "$tmp/interrupted/root/etc/opkg" -name '.customfeeds.conf.*' -o -name '.keithah-key.*' |
+	awk 'NR == 1 { found = 1 } END { exit !found }'; then
+	lifecycle_failures="$lifecycle_failures TERM leaked temporary files;"
+fi
+
+[ -z "$lifecycle_failures" ] || fail "$lifecycle_failures"
 
 printf '%s\n' 'installer tests passed'

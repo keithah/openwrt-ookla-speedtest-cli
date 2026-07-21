@@ -32,10 +32,31 @@ fi
 [ -f "$feeds_file" ] || : >"$feeds_file"
 
 feeds_dir=$(dirname "$feeds_file")
+tmp_file=''
+trim_file=''
+key_tmp=''
+
+cleanup() {
+	[ -z "$tmp_file" ] || rm -f "$tmp_file" || :
+	[ -z "$trim_file" ] || rm -f "$trim_file" || :
+	[ -z "$key_tmp" ] || rm -f "$key_tmp" || :
+}
+
+handle_signal() {
+	status=$1
+	trap - 0 HUP INT TERM
+	cleanup
+	exit "$status"
+}
+
+trap 'cleanup' 0
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+
 tmp_file=$(mktemp "$feeds_dir/.customfeeds.conf.XXXXXX")
 trim_file=$(mktemp "$feeds_dir/.customfeeds.conf.trim.XXXXXX")
 key_tmp=$(mktemp "$keys_dir/.keithah-key.XXXXXX")
-trap 'rm -f "$tmp_file" "$trim_file" "$key_tmp"' 0 HUP INT TERM
 
 printf '%s\n' "$feed_key" >"$key_tmp"
 chmod 0644 "$key_tmp"
