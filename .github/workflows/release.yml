@@ -1,0 +1,102 @@
+name: Publish release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Makefile
+      - scripts/build_ipk.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: speedtest-release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Run full test suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Determine release identity
+        id: release
+        shell: bash
+        run: |
+          mapfile -t versions < <(sed -nE 's/^PKG_VERSION:=([0-9]+(\.[0-9]+)*)$/\1/p' Makefile)
+          if (( ${#versions[@]} != 1 )); then
+            echo "Expected exactly one valid PKG_VERSION in Makefile" >&2
+            exit 1
+          fi
+          mapfile -t releases < <(sed -nE 's/^PKG_RELEASE:=([0-9]+)$/\1/p' Makefile)
+          if (( ${#releases[@]} != 1 )); then
+            echo "Expected exactly one valid PKG_RELEASE in Makefile" >&2
+            exit 1
+          fi
+          version="${versions[0]}"
+          release="${releases[0]}"
+          tag="v$version"
+          ipk="ookla-speedtest-cli_${version}-${release}_aarch64_cortex-a53.ipk"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ipk=$ipk" >> "$GITHUB_OUTPUT"
+
+      - name: Build release files
+        run: |
+          mkdir -p dist
+          python3 -c 'from pathlib import Path; from scripts.build_ipk import build_ipk; build_ipk(Path("Makefile"), Path("dist"))'
+          install -m 0755 scripts/install.sh dist/install-ookla-speedtest-cli.sh
+
+      - name: Verify exact release inventory
+        env:
+          IPK: ${{ steps.release.outputs.ipk }}
+        shell: bash
+        run: |
+          expected=$(printf '%s\n%s\n' "$IPK" install-ookla-speedtest-cli.sh | sort)
+          actual=$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Unexpected dist inventory" >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+
+      - name: Create or verify release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          IPK: ${{ steps.release.outputs.ipk }}
+        shell: bash
+        run: |
+          tag="$TAG"
+          expected=$(printf '%s\n%s\n' "$IPK" install-ookla-speedtest-cli.sh | sort)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            release_assets=$(gh release view "$tag" --json assets --jq '.assets[].name' | sort)
+            if [[ "$release_assets" == "$expected" ]]; then
+              echo "Release $tag already has the expected assets"
+              exit 0
+            fi
+            echo "Release $tag exists with an unexpected asset inventory" >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$release_assets") || true
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag exists without a release; refusing to overwrite it" >&2
+            exit 1
+          fi
+          gh release create "$tag" \
+            "dist/$IPK" \
+            dist/install-ookla-speedtest-cli.sh \
+            --title "$tag" \
+            --generate-notes

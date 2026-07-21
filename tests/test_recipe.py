@@ -10,6 +10,7 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 RECIPE = REPOSITORY_ROOT / "Makefile"
 UPDATE_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "update-ookla.yml"
+RELEASE_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "release.yml"
 GITIGNORE = REPOSITORY_ROOT / ".gitignore"
 README = REPOSITORY_ROOT / "README.md"
 
@@ -172,11 +173,16 @@ class RecipeTest(unittest.TestCase):
             "schedule:",
             "workflow_dispatch:",
             "contents: write",
+            "actions: write",
+            "actions/checkout@v7",
+            "actions/setup-python@v7",
+            "ref: main",
             "group:",
             "python3 scripts/update_ookla.py",
             "python3 -m unittest discover -s tests -v",
             "github-actions[bot]",
             "git push origin HEAD:main",
+            "gh workflow run release.yml --ref main",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, workflow)
@@ -185,6 +191,76 @@ class RecipeTest(unittest.TestCase):
             "actions/upload-artifact",
             "actions/create-release",
             "softprops/action-gh-release",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+
+        push_index = workflow.find("git push origin HEAD:main")
+        dispatch_index = workflow.find("gh workflow run release.yml --ref main")
+        if push_index >= 0 and dispatch_index >= 0:
+            self.assertLess(
+                push_index,
+                dispatch_index,
+                "the release workflow must be dispatched after the update is pushed",
+            )
+        self.assertRegex(
+            workflow,
+            r"(?s)- name: Dispatch Speedtest release\s+"
+            r"if: steps\.recipe\.outputs\.changed == 'true'\s+"
+            r"env:\s+GH_TOKEN: \$\{\{ github\.token \}\}\s+"
+            r"run: gh workflow run release\.yml --ref main",
+        )
+
+    def test_release_workflow_policy(self):
+        self.assertTrue(RELEASE_WORKFLOW.is_file(), "release workflow is missing")
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+        for required in (
+            "workflow_dispatch:",
+            "contents: write",
+            "group: speedtest-release-main",
+            "branches: [main]",
+            "- Makefile",
+            "- scripts/build_ipk.py",
+            "actions/checkout@v7",
+            "actions/setup-python@v7",
+            "ref: main",
+            "python3 -m unittest discover -s tests -v",
+            "from scripts.build_ipk import build_ipk",
+            'build_ipk(Path("Makefile"), Path("dist"))',
+            "install-ookla-speedtest-cli.sh",
+            'tag="v$version"',
+            'gh release view "$tag"',
+            'gh release create "$tag"',
+            'refs/tags/$tag',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, workflow)
+
+        self.assertLess(
+            workflow.index("python3 -m unittest discover -s tests -v"),
+            workflow.index("from scripts.build_ipk import build_ipk"),
+            "the full test suite must pass before the package is built",
+        )
+        self.assertRegex(
+            workflow,
+            r"mapfile -t versions < <\(sed -nE "
+            r"'s/\^PKG_VERSION:=\(\[0-9\]\+\(\\\.\[0-9\]\+\)\*\)\$/\\1/p' "
+            r"Makefile\)",
+        )
+        self.assertIn('if (( ${#versions[@]} != 1 )); then', workflow)
+        self.assertIn('expected=$(printf \'%s\\n%s\\n\'', workflow)
+        self.assertIn('actual=$(find dist -maxdepth 1 -type f -printf \'%f\\n\'', workflow)
+        self.assertIn('release_assets=$(gh release view "$tag" --json assets', workflow)
+        self.assertIn('[[ "$release_assets" == "$expected" ]]', workflow)
+
+        for forbidden in (
+            "*.tgz",
+            "*.tar.gz",
+            "actions/upload-artifact",
+            "actions/create-release",
+            "softprops/action-gh-release",
+            "--clobber",
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, workflow)
