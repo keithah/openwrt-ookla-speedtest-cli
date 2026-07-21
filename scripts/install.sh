@@ -33,17 +33,41 @@ fi
 
 feeds_dir=$(dirname "$feeds_file")
 tmp_file=$(mktemp "$feeds_dir/.customfeeds.conf.XXXXXX")
+trim_file=$(mktemp "$feeds_dir/.customfeeds.conf.trim.XXXXXX")
 key_tmp=$(mktemp "$keys_dir/.keithah-key.XXXXXX")
-trap 'rm -f "$tmp_file" "$key_tmp"' 0 HUP INT TERM
+trap 'rm -f "$tmp_file" "$trim_file" "$key_tmp"' 0 HUP INT TERM
 
 printf '%s\n' "$feed_key" >"$key_tmp"
 chmod 0644 "$key_tmp"
 mv "$key_tmp" "$feed_key_file"
 
-# Preserve every unrelated line while replacing managed feed entries with one.
+# Preserve every unrelated record while replacing managed feed entries with one.
+# The neutral entry comes first so an unrelated unterminated final record can
+# remain at EOF without joining the new entry.
+printf 'src/gz keithah %s\n' "$feed_url" >"$tmp_file"
 awk '$1 == "src/gz" && ($2 == "starwatch" || $2 == "wattline" || $2 == "keithah") { next } { print }' \
-	"$feeds_file" >"$tmp_file"
-printf 'src/gz keithah %s\n' "$feed_url" >>"$tmp_file"
+	"$feeds_file" >>"$tmp_file"
+
+# awk terminates every emitted record. If the original final record was both
+# retained and unterminated, remove only that synthesized final newline.
+input_size=$(wc -c <"$feeds_file")
+trim_final_newline=no
+if [ "$input_size" -gt 0 ]; then
+	dd if="$feeds_file" of="$trim_file" bs=1 skip=$((input_size - 1)) count=1 2>/dev/null
+	last_byte_newlines=$(wc -l <"$trim_file")
+	if [ "$last_byte_newlines" -eq 0 ] &&
+		awk 'END { exit ($1 == "src/gz" && ($2 == "starwatch" || $2 == "wattline" || $2 == "keithah")) }' \
+			"$feeds_file"; then
+		trim_final_newline=yes
+	fi
+fi
+if [ "$trim_final_newline" = yes ]; then
+	output_size=$(wc -c <"$tmp_file")
+	dd if="$tmp_file" of="$trim_file" bs=1 count=$((output_size - 1)) 2>/dev/null
+	mv "$trim_file" "$tmp_file"
+else
+	rm -f "$trim_file"
+fi
 
 if metadata=$(stat -c '%a %u %g' "$feeds_file" 2>/dev/null); then
 	set -- $metadata

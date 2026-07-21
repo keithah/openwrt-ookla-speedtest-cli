@@ -124,4 +124,34 @@ assert_count "$tmp/supported/commands" '^opkg update$' 2
 assert_count "$tmp/supported/commands" '^opkg install ookla-speedtest-cli$' 2
 assert_count "$tmp/supported/commands" '^opkg install ' 2
 
+# An unrelated unterminated final record must remain byte-for-byte at EOF.
+unterminated_unrelated='src/gz core https://downloads.example/core
+src/gz final https://downloads.example/final'
+make_case unterminated_unrelated "$unterminated_unrelated"
+run_case unterminated_unrelated OOKLA_FEED_URL='https://feed.example/packages'
+unterminated_unrelated_expected="$tmp/unterminated-unrelated-expected"
+printf 'src/gz keithah https://feed.example/packages\nsrc/gz core https://downloads.example/core\nsrc/gz final https://downloads.example/final' \
+	>"$unterminated_unrelated_expected"
+cmp -s "$unterminated_unrelated_expected" \
+	"$tmp/unterminated_unrelated/root/etc/opkg/customfeeds.conf" ||
+	fail 'unterminated unrelated final record was not preserved exactly at EOF'
+
+# Rewriting that result must retain the same unterminated EOF idempotently.
+run_case unterminated_unrelated OOKLA_FEED_URL='https://feed.example/packages'
+cmp -s "$unterminated_unrelated_expected" \
+	"$tmp/unterminated_unrelated/root/etc/opkg/customfeeds.conf" ||
+	fail 'second run changed unterminated unrelated final record'
+
+# An unterminated managed final record must be removed without damaging output.
+unterminated_managed='src/gz core https://downloads.example/core
+src/gz keithah https://legacy.example/feed'
+make_case unterminated_managed "$unterminated_managed"
+run_case unterminated_managed OOKLA_FEED_URL='https://feed.example/packages'
+unterminated_managed_expected="$tmp/unterminated-managed-expected"
+printf 'src/gz keithah https://feed.example/packages\nsrc/gz core https://downloads.example/core\n' \
+	>"$unterminated_managed_expected"
+cmp -s "$unterminated_managed_expected" \
+	"$tmp/unterminated_managed/root/etc/opkg/customfeeds.conf" ||
+	fail 'unterminated managed final record was not removed cleanly'
+
 printf '%s\n' 'installer tests passed'
