@@ -83,13 +83,33 @@ jobs:
           expected=$(printf '%s\n%s\n' "$IPK" install-ookla-speedtest-cli.sh | sort)
           if gh release view "$tag" >/dev/null 2>&1; then
             release_assets=$(gh release view "$tag" --json assets --jq '.assets[].name' | sort)
-            if [[ "$release_assets" == "$expected" ]]; then
-              echo "Release $tag already has the expected assets"
-              exit 0
+            if [[ "$release_assets" != "$expected" ]]; then
+              echo "Release $tag exists with an unexpected asset inventory" >&2
+              diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$release_assets") || true
+              exit 1
             fi
-            echo "Release $tag exists with an unexpected asset inventory" >&2
-            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$release_assets") || true
-            exit 1
+
+            existing_dir=$(mktemp -d)
+            cleanup() {
+              if [[ -n "${existing_dir:-}" && -d "$existing_dir" ]]; then
+                rm -rf -- "$existing_dir"
+              fi
+            }
+            trap cleanup EXIT
+            gh release download "$tag" \
+              --dir "$existing_dir" \
+              --pattern "$IPK" \
+              --pattern install-ookla-speedtest-cli.sh
+            downloaded=$(find "$existing_dir" -maxdepth 1 -type f -printf '%f\n' | sort)
+            if [[ "$downloaded" != "$expected" ]]; then
+              echo "Downloaded release $tag has an unexpected asset inventory" >&2
+              diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$downloaded") || true
+              exit 1
+            fi
+            cmp -- "dist/$IPK" "$existing_dir/$IPK"
+            cmp -- dist/install-ookla-speedtest-cli.sh "$existing_dir/install-ookla-speedtest-cli.sh"
+            echo "Release $tag assets match the freshly built files"
+            exit 0
           fi
           if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
             echo "Tag $tag exists without a release; refusing to overwrite it" >&2

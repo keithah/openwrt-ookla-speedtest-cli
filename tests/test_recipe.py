@@ -231,6 +231,17 @@ class RecipeTest(unittest.TestCase):
             "install-ookla-speedtest-cli.sh",
             'tag="v$version"',
             'gh release view "$tag"',
+            'existing_dir=$(mktemp -d)',
+            '[[ -n "${existing_dir:-}" && -d "$existing_dir" ]]',
+            'rm -rf -- "$existing_dir"',
+            'trap cleanup EXIT',
+            'gh release download "$tag"',
+            '--dir "$existing_dir"',
+            '--pattern "$IPK"',
+            '--pattern install-ookla-speedtest-cli.sh',
+            'downloaded=$(find "$existing_dir" -maxdepth 1 -type f -printf',
+            'cmp -- "dist/$IPK" "$existing_dir/$IPK"',
+            'cmp -- dist/install-ookla-speedtest-cli.sh "$existing_dir/install-ookla-speedtest-cli.sh"',
             'gh release create "$tag"',
             'refs/tags/$tag',
         ):
@@ -252,7 +263,20 @@ class RecipeTest(unittest.TestCase):
         self.assertIn('expected=$(printf \'%s\\n%s\\n\'', workflow)
         self.assertIn('actual=$(find dist -maxdepth 1 -type f -printf \'%f\\n\'', workflow)
         self.assertIn('release_assets=$(gh release view "$tag" --json assets', workflow)
-        self.assertIn('[[ "$release_assets" == "$expected" ]]', workflow)
+        self.assertIn('[[ "$release_assets" != "$expected" ]]', workflow)
+        download_index = workflow.find('gh release download "$tag"')
+        compare_index = workflow.find('cmp -- "dist/$IPK" "$existing_dir/$IPK"')
+        if download_index >= 0 and compare_index >= 0:
+            self.assertLess(
+                download_index,
+                compare_index,
+                "existing assets must be downloaded before their contents are compared",
+            )
+        self.assertRegex(
+            workflow,
+            r'(?s)downloaded=\$\(find "\$existing_dir".*?\| sort\)\s+'
+            r'if \[\[ "\$downloaded" != "\$expected" \]\]; then',
+        )
 
         for forbidden in (
             "*.tgz",
